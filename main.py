@@ -558,7 +558,7 @@ MINUTE_CHOICES = [
 ]
 
 
-@bot.tree.command(name="設定活動", description="【管理員】設定聯賽活動並建立討論串")
+@bot.tree.command(name="new_event", description="【管理員】設定聯賽活動並建立討論串")
 @app_commands.describe(
     名稱="活動名稱，例如：秋季聯賽",
     對手幫會="對手幫會名稱",
@@ -673,7 +673,7 @@ async def set_event(
         await interaction.followup.send(f"❌ 建立討論串失敗：{e}", ephemeral=True)
 
 
-@bot.tree.command(name="匯出名單", description="【管理員】將目前報名名單匯出成 Excel（自動分組）")
+@bot.tree.command(name="export_excel", description="【管理員】將目前報名名單匯出成 Excel（自動分組）")
 @app_commands.default_permissions(administrator=True)
 async def export_list(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -817,7 +817,7 @@ async def export_list(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="狀態", description="查看目前報名狀態")
+@bot.tree.command(name="event_status", description="查看目前報名狀態")
 async def status_cmd(interaction: discord.Interaction):
     guild_data = get_guild_data(interaction.guild.id)
     if not guild_data.get("event_name"):
@@ -827,7 +827,7 @@ async def status_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="強制關閉報名", description="【管理員】立即關閉報名按鈕")
+@bot.tree.command(name="close_event", description="【管理員】立即關閉報名按鈕")
 @app_commands.default_permissions(administrator=True)
 async def force_close(interaction: discord.Interaction):
     guild_data = get_guild_data(interaction.guild.id)
