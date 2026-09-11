@@ -19,7 +19,23 @@ import itertools
 load_dotenv()
 
 # ==================== 設定區 ====================
-TOKEN = os.getenv("DISCORD_TOKEN")
+@client.event
+try:
+  token = os.getenv("DISCORD_TOKEN") or ""
+  if token == "":
+    raise Exception("Please add your token to the Secrets pane.")
+  keep_alive()
+  client.run(token)
+except discord.HTTPException as e:
+    if e.status == 429:
+        print(
+            "The Discord servers denied the connection for making too many requests"
+        )
+        print(
+            "Get help from https://stackoverflow.com/questions/66724687/in-discord-py-how-to-solve-the-error-for-toomanyrequests"
+        )
+    else:
+        raise e
 
 try:
     TZ = ZoneInfo("Asia/Taipei")
