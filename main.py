@@ -509,7 +509,7 @@ class SignupView(discord.ui.View):
             label="取消報名",
             style=discord.ButtonStyle.danger,
             custom_id="cancel_signup_btn",
-            emoji="❌",
+            emoji="⚠️",
             disabled=disabled
         )
         cancel_btn.callback = self.cancel_callback
