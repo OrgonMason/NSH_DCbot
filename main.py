@@ -19,23 +19,7 @@ import itertools
 load_dotenv()
 
 # ==================== 設定區 ====================
-@client.event
-try:
-  token = os.getenv("DISCORD_TOKEN") or ""
-  if token == "":
-    raise Exception("Please add your token to the Secrets pane.")
-  keep_alive()
-  client.run(token)
-except discord.HTTPException as e:
-    if e.status == 429:
-        print(
-            "The Discord servers denied the connection for making too many requests"
-        )
-        print(
-            "Get help from https://stackoverflow.com/questions/66724687/in-discord-py-how-to-solve-the-error-for-toomanyrequests"
-        )
-    else:
-        raise e
+TOKEN = os.getenv("DISCORD_TOKEN")
 
 try:
     TZ = ZoneInfo("Asia/Taipei")
@@ -574,7 +558,7 @@ MINUTE_CHOICES = [
 ]
 
 
-@bot.tree.command(name="new_event", description="【管理員】設定聯賽活動並建立討論串")
+@bot.tree.command(name="設定活動", description="【管理員】設定聯賽活動並建立討論串")
 @app_commands.describe(
     名稱="活動名稱，例如：秋季聯賽",
     對手幫會="對手幫會名稱",
@@ -689,7 +673,7 @@ async def set_event(
         await interaction.followup.send(f"❌ 建立討論串失敗：{e}", ephemeral=True)
 
 
-@bot.tree.command(name="export_excel", description="【管理員】將目前報名名單匯出成 Excel（自動分組）")
+@bot.tree.command(name="匯出名單", description="【管理員】將目前報名名單匯出成 Excel（自動分組）")
 @app_commands.default_permissions(administrator=True)
 async def export_list(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -833,7 +817,7 @@ async def export_list(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="event_status", description="查看目前報名狀態")
+@bot.tree.command(name="狀態", description="查看目前報名狀態")
 async def status_cmd(interaction: discord.Interaction):
     guild_data = get_guild_data(interaction.guild.id)
     if not guild_data.get("event_name"):
@@ -843,7 +827,7 @@ async def status_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="close_event", description="【管理員】立即關閉報名按鈕")
+@bot.tree.command(name="強制關閉報名", description="【管理員】立即關閉報名按鈕")
 @app_commands.default_permissions(administrator=True)
 async def force_close(interaction: discord.Interaction):
     guild_data = get_guild_data(interaction.guild.id)
@@ -888,7 +872,23 @@ async def on_ready():
 
 
 if __name__ == "__main__":
-    if not TOKEN:
-        print("❌ 請在 .env 檔案設定 DISCORD_TOKEN")
-    else:
-        bot.run(TOKEN)
+    # 引入 keep_alive（用於 Replit 等平台保持 Bot 活著）
+    try:
+        from keep_alive import keep_alive
+        keep_alive()
+        print("✅ keep_alive 已啟動")
+    except ImportError:
+        print("⚠️ 找不到 keep_alive.py，略過 keep_alive（本地執行可忽略）")
+
+    token = os.getenv("DISCORD_TOKEN") or ""
+    if token == "":
+        raise Exception("Please add your token to the Secrets pane. / 請在 .env 或 Secrets 設定 DISCORD_TOKEN")
+
+    try:
+        bot.run(token)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            print("The Discord servers denied the connection for making too many requests")
+            print("Get help from https://stackoverflow.com/questions/66724687/in-discord-py-how-to-solve-the-error-for-toomanyrequests")
+        else:
+            raise e
