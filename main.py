@@ -1221,25 +1221,25 @@ async def on_ready():
     print(f"✅ 已登入為 {bot.user}")
     bot.add_view(SignupView(disabled=False))
 
-    # 清除所有指令的「預設需要管理員權限」限制，讓所有人都能「看到」指令
-    # 實際能否執行仍由 has_required_role（身分組「管理員」）控制
+    # 清除「需要管理員才能看到」的預設權限（執行權限仍由身分組「管理員」檢查）
     for cmd in bot.tree.get_commands():
         cmd.default_permissions = None
 
     try:
-        synced = await bot.tree.sync()
-        print(f"✅ 全域同步 {len(synced)} 個指令（所有人可見，僅「管理員」身分組可執行）：")
-        for cmd in synced:
-            print(f"   /{cmd.name}")
-
-        # 再對每個伺服器同步一次，較快生效
+        # 1) 先清除各伺服器的「伺服器專用指令」，避免與全域指令重複顯示
         for guild in bot.guilds:
             try:
-                bot.tree.copy_global_to(guild=guild)
-                g_synced = await bot.tree.sync(guild=guild)
-                print(f"   → 伺服器「{guild.name}」同步 {len(g_synced)} 個指令")
+                bot.tree.clear_commands(guild=guild)
+                await bot.tree.sync(guild=guild)
+                print(f"🧹 已清除伺服器「{guild.name}」的重複指令")
             except Exception as ge:
-                print(f"   → 伺服器「{guild.name}」同步失敗: {ge}")
+                print(f"清除伺服器「{guild.name}」指令失敗: {ge}")
+
+        # 2) 只做一次全域同步（所有人看得到，不會重複）
+        synced = await bot.tree.sync()
+        print(f"✅ 全域同步 {len(synced)} 個指令（不重複）：")
+        for cmd in synced:
+            print(f"   /{cmd.name}")
     except Exception as e:
         print(f"❌ 同步指令失敗: {e}")
 
