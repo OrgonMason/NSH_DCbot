@@ -13,6 +13,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from io import BytesIO
 from collections import defaultdict
+import random
 
 load_dotenv()
 
@@ -50,8 +51,7 @@ TEAM_NAMES = [
     "三團一隊", "三團二隊", "三團三隊", "三團四隊"
 ]
 
-# 請改成你伺服器實際的身分組名稱
-REQUIRED_ROLE_NAME = "優樂城【荷官】"
+REQUIRED_ROLE_NAME = "管理員"
 
 DATA_FILE = "event_data.json"
 WEEKDAY_ZH = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -90,14 +90,18 @@ def get_guild_data(guild_id: int) -> dict:
             "channel_id": None,
             "thread_id": None,
             "message_id": None,
-            "signups": {},
+            "signups": {},       # 正式報名
+            "waitlist": {},      # 候補 {key: info}
             "teams": [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)],
             "registration_closed": False
         }
         save_data(data)
-    if "teams" not in data[gid]:
-        data[gid]["teams"] = [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)]
-    return data[gid]
+    g = data[gid]
+    if "teams" not in g:
+        g["teams"] = [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)]
+    if "waitlist" not in g:
+        g["waitlist"] = {}
+    return g
 
 
 def update_guild_data(guild_id: int, guild_data: dict):
@@ -146,24 +150,35 @@ def get_job_counts(signups: dict) -> Dict[str, int]:
     return counts
 
 
-def get_remaining_slots(signups: dict) -> int:
-    return MAX_PLAYERS - len(signups)
+def get_waitlist_by_job(waitlist: dict, job: str) -> List[Tuple[str, dict]]:
+    """回傳該職業候補名單，依加入順序排序"""
+    items = [(k, v) for k, v in waitlist.items() if v.get("job") == job]
+    items.sort(key=lambda x: x[1].get("joined_at", ""))
+    return items
 
 
-def count_user_signups(signups: dict, user_id: str) -> Tuple[int, int]:
+def count_user_entries(signups: dict, waitlist: dict, user_id: str) -> Tuple[int, int]:
+    """回傳 (一般正式+候補次數, 代報正式+候補次數)"""
     normal = 0
     proxy = 0
-    for uid, info in signups.items():
-        owner = info.get("owner_id", uid)
-        if owner == user_id:
-            if info.get("is_proxy"):
-                proxy += 1
-            else:
-                normal += 1
+    for src in (signups, waitlist):
+        for key, info in src.items():
+            owner = info.get("owner_id", key)
+            if owner == user_id:
+                if info.get("is_proxy"):
+                    proxy += 1
+                else:
+                    normal += 1
     return normal, proxy
 
 
 def find_best_slot(guild_data: dict, job: str) -> Optional[Tuple[int, int]]:
+    """
+    尋找最適合的隊伍位置。
+    第一階段：盡量職業不重複（素問最多 2）。
+    第二階段：若第一階段找不到（例如鐵衣已超過 10 人），
+              允許同隊重複職業，隨機分到仍有空位的隊伍。
+    """
     teams = guild_data["teams"]
 
     def team_job_count(t_idx: int, j: str) -> int:
@@ -172,59 +187,79 @@ def find_best_slot(guild_data: dict, job: str) -> Optional[Tuple[int, int]]:
     def empty_slots(t_idx: int) -> List[int]:
         return [i for i, p in enumerate(teams[t_idx]) if p is None]
 
-    candidates = []
+    def team_size(t_idx: int) -> int:
+        return sum(1 for p in teams[t_idx] if p is not None)
 
+    # ---------- 第一階段：職業不重複優先 ----------
+    candidates = []
     for t in range(NUM_TEAMS):
         empties = empty_slots(t)
         if not empties:
             continue
-
-        # 職業不重複（素問最多2個）
         if job != "素問" and team_job_count(t, job) >= 1:
             continue
         if job == "素問" and team_job_count(t, "素問") >= 2:
             continue
 
-        # 位置偏好
         if job in ("鐵衣", "血河"):
             preferred = [0] if 0 in empties else empties
         elif job == "素問":
             preferred = [s for s in (4, 5) if s in empties] or empties
         else:
             preferred = empties
-
         if not preferred:
             continue
-
         slot = preferred[0]
         score = len(empties) * 10
-
-        # 強制需求加權
-        if t < 4:  # 1-4 隊：鐵衣 + 2素問
+        if t < 4:
             if job == "鐵衣" and team_job_count(t, "鐵衣") == 0:
                 score += 50
             if job == "素問" and team_job_count(t, "素問") < 2:
                 score += 40
-        elif t in (4, 5):  # 5-6 隊：至少1素問
+        elif t in (4, 5):
             if job == "素問" and team_job_count(t, "素問") == 0:
                 score += 45
-        else:  # 7-10 隊：血河 + 素問
+        else:
             if job == "血河" and team_job_count(t, "血河") == 0:
                 score += 50
             if job == "素問" and team_job_count(t, "素問") == 0:
                 score += 40
-
         candidates.append((score, t, slot))
 
-    if not candidates:
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][1], candidates[0][2]
+
+    # ---------- 第二階段：允許重複職業，分到仍有空位的隊伍 ----------
+    fallback = []
+    for t in range(NUM_TEAMS):
+        empties = empty_slots(t)
+        if not empties:
+            continue
+        # 鐵衣/血河仍優先空著的第 1 位；素問優先 5、6 位
+        if job in ("鐵衣", "血河") and 0 in empties:
+            slot = 0
+        elif job == "素問":
+            pref = [s for s in (4, 5) if s in empties]
+            slot = pref[0] if pref else random.choice(empties)
+        else:
+            slot = random.choice(empties)
+        # 分數：人數越少的隊伍優先
+        score = -team_size(t)
+        fallback.append((score, t, slot))
+
+    if not fallback:
         return None
-    candidates.sort(reverse=True)
-    return candidates[0][1], candidates[0][2]
+
+    fallback.sort(reverse=True)
+    best_score = fallback[0][0]
+    top = [x for x in fallback if x[0] == best_score]
+    chosen = random.choice(top)
+    return chosen[1], chosen[2]
 
 
 def place_player(guild_data: dict, key: str, info: dict) -> bool:
-    job = info["job"]
-    result = find_best_slot(guild_data, job)
+    result = find_best_slot(guild_data, info["job"])
     if result is None:
         return False
     t_idx, s_idx = result
@@ -233,11 +268,21 @@ def place_player(guild_data: dict, key: str, info: dict) -> bool:
     guild_data["teams"][t_idx][s_idx] = {
         "uid": key,
         "char_name": info["char_name"],
-        "job": job,
+        "job": info["job"],
         "is_proxy": info.get("is_proxy", False),
         "name": info.get("name", "")
     }
     return True
+
+
+def assign_unassigned_players(guild_data: dict):
+    """把尚未分到隊伍的正式報名者補上位置（修正舊資料或先前演算法漏分）"""
+    changed = False
+    for key, info in list(guild_data.get("signups", {}).items()):
+        if info.get("team") is None:
+            if place_player(guild_data, key, info):
+                changed = True
+    return changed
 
 
 def remove_player_from_teams(guild_data: dict, key: str):
@@ -248,10 +293,68 @@ def remove_player_from_teams(guild_data: dict, key: str):
                 guild_data["teams"][t][s] = None
 
 
+async def promote_from_waitlist(guild: discord.Guild, guild_data: dict, job: str):
+    """當正式名額有空缺時，把該職業候補第1位升上正式"""
+    waitlist = guild_data.get("waitlist", {})
+    items = get_waitlist_by_job(waitlist, job)
+    if not items:
+        return
+
+    key, info = items[0]
+    # 從候補移除
+    del waitlist[key]
+
+    # 放到正式
+    success = place_player(guild_data, key, info)
+    if not success:
+        info["team"] = None
+        info["slot"] = None
+    guild_data["signups"][key] = info
+    update_guild_data(guild.id, guild_data)
+    await update_thread_status(guild)
+
+    # 私訊通知升上正式
+    try:
+        owner_id = int(info.get("owner_id", key) if not str(key).startswith("proxy_") else info.get("owner_id"))
+        user = guild.get_member(owner_id) or await bot.fetch_user(owner_id)
+        if user:
+            team_text = ""
+            if info.get("team") is not None:
+                team_text = f"\n隊伍：{TEAM_NAMES[info['team']]} 第 {info['slot']+1} 位"
+            dm = discord.Embed(
+                title="🎉 候補轉正通知",
+                description=f"你的角色 **{info['char_name']}【{job}】** 已從候補轉為正式報名！",
+                color=discord.Color.green()
+            )
+            dm.add_field(name="活動", value=guild_data.get("event_name", ""), inline=False)
+            if team_text:
+                dm.add_field(name="分配", value=team_text.strip(), inline=False)
+            await user.send(embed=dm)
+    except Exception as e:
+        print(f"升上正式私訊失敗: {e}")
+
+    # 通知剩下的候補人順位往前
+    remaining = get_waitlist_by_job(guild_data.get("waitlist", {}), job)
+    for idx, (wkey, winfo) in enumerate(remaining, 1):
+        try:
+            owner_id = int(winfo.get("owner_id", 0))
+            if not owner_id:
+                continue
+            user = guild.get_member(owner_id) or await bot.fetch_user(owner_id)
+            if user:
+                await user.send(
+                    f"📢 候補順位更新通知\n"
+                    f"你的角色 **{winfo['char_name']}【{job}】** 目前候補順位為第 **{idx}** 位。"
+                )
+        except Exception:
+            pass
+
+
 def format_status_embed(guild_data: dict) -> discord.Embed:
     signups = guild_data.get("signups", {})
+    waitlist = guild_data.get("waitlist", {})
     job_counts = get_job_counts(signups)
-    remaining = get_remaining_slots(signups)
+    remaining = MAX_PLAYERS - len(signups)
     total = len(signups)
     closed = is_deadline_passed(guild_data)
 
@@ -264,17 +367,24 @@ def format_status_embed(guild_data: dict) -> discord.Embed:
     embed.add_field(name="⏰ 約戰時間", value=guild_data.get("event_date") or "未設定", inline=True)
     embed.add_field(name="📅 報名截止", value=guild_data.get("deadline") or "未設定", inline=True)
 
-    status_text = "🔴 **報名已截止**" if closed else f"🟢 報名進行中（剩餘 **{remaining}** 名額）"
-    embed.add_field(name="📊 目前人數", value=f"{total} / {MAX_PLAYERS}\n{status_text}", inline=False)
+    status_text = "🔴 **報名已截止**" if closed else f"🟢 報名進行中（正式剩餘 **{remaining}** 名額）"
+    embed.add_field(name="📊 目前正式人數", value=f"{total} / {MAX_PLAYERS}\n{status_text}", inline=False)
 
     job_lines = []
     for job in JOBS:
         count = job_counts[job]
         emoji = JOB_EMOJI.get(job, "⚪")
-        status = "🔴 已滿" if count >= MAX_PER_JOB else f"剩餘 {MAX_PER_JOB - count}"
+        wl_count = len(get_waitlist_by_job(waitlist, job))
+        if count >= MAX_PER_JOB:
+            status = f"🔴 已滿（候補 {wl_count} 人）"
+        else:
+            status = f"剩餘 {MAX_PER_JOB - count}"
+            if wl_count:
+                status += f"（候補 {wl_count} 人）"
         job_lines.append(f"{emoji} **{job}**：{count}/{MAX_PER_JOB}　{status}")
     embed.add_field(name="🗡️ 職業報名狀況", value="\n".join(job_lines), inline=False)
 
+    # 正式名單
     if signups:
         by_job = {job: [] for job in JOBS}
         for info in signups.values():
@@ -289,11 +399,29 @@ def format_status_embed(guild_data: dict) -> discord.Embed:
                 emoji = JOB_EMOJI.get(job, "")
                 list_lines.append(f"{emoji} **{job}**\n" + "、".join(by_job[job]))
         full_list = "\n\n".join(list_lines)
-        if len(full_list) > 1000:
-            full_list = full_list[:980] + "\n…（已截斷）"
-        embed.add_field(name="👥 已報名成功人員", value=full_list, inline=False)
+        if len(full_list) > 900:
+            full_list = full_list[:880] + "\n…（已截斷）"
+        embed.add_field(name="👥 正式報名人員", value=full_list, inline=False)
     else:
-        embed.add_field(name="👥 已報名成功人員", value="目前尚無人報名", inline=False)
+        embed.add_field(name="👥 正式報名人員", value="目前尚無人報名", inline=False)
+
+    # 候補名單
+    if waitlist:
+        wl_by_job = {job: [] for job in JOBS}
+        for job in JOBS:
+            items = get_waitlist_by_job(waitlist, job)
+            for idx, (_, info) in enumerate(items, 1):
+                prefix = "(代報)" if info.get("is_proxy") else ""
+                wl_by_job[job].append(f"{idx}.{prefix}{info.get('char_name')}【{job}】")
+        wl_lines = []
+        for job in JOBS:
+            if wl_by_job[job]:
+                emoji = JOB_EMOJI.get(job, "")
+                wl_lines.append(f"{emoji} **{job}**\n" + "、".join(wl_by_job[job]))
+        wl_text = "\n\n".join(wl_lines)
+        if len(wl_text) > 900:
+            wl_text = wl_text[:880] + "\n…（已截斷）"
+        embed.add_field(name="⏳ 候補名單", value=wl_text, inline=False)
 
     embed.set_footer(text="⛔ 報名已截止" if closed else "請使用下方按鈕進行報名 / 代報")
     embed.timestamp = datetime.now(TZ)
@@ -303,12 +431,10 @@ def format_status_embed(guild_data: dict) -> discord.Embed:
 def format_team_status_embed(guild_data: dict) -> discord.Embed:
     teams = guild_data.get("teams", [[None]*6 for _ in range(10)])
     job_counts = get_job_counts(guild_data.get("signups", {}))
-
     embed = discord.Embed(
         title=f"📋 {guild_data.get('event_name', '聯賽')} 隊伍分配狀態",
         color=discord.Color.gold()
     )
-
     for t_idx in range(NUM_TEAMS):
         team = teams[t_idx]
         lines = []
@@ -320,7 +446,8 @@ def format_team_status_embed(guild_data: dict) -> discord.Embed:
                 emoji = JOB_EMOJI.get(p["job"], "⚪")
                 prefix = "(代報)" if p.get("is_proxy") else ""
                 lines.append(f"`{pos}.` {emoji} {prefix}{p['char_name']}【{p['job']}】")
-        embed.add_field(name=f"🛡️ {TEAM_NAMES[t_idx]}", value="\n".join(lines), inline=True)
+        num_emoji = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"][t_idx]
+        embed.add_field(name=f"{num_emoji} {TEAM_NAMES[t_idx]}", value="\n".join(lines), inline=True)
 
     stats = [f"{JOB_EMOJI.get(j, '⚪')} {j}:{job_counts[j]}" for j in JOBS]
     embed.add_field(name="📊 職業統計", value="　".join(stats), inline=False)
@@ -331,6 +458,9 @@ def format_team_status_embed(guild_data: dict) -> discord.Embed:
 
 async def update_thread_status(guild: discord.Guild):
     guild_data = get_guild_data(guild.id)
+    # 自動補上未分配隊伍的成員
+    if assign_unassigned_players(guild_data):
+        update_guild_data(guild.id, guild_data)
     thread_id = guild_data.get("thread_id")
     message_id = guild_data.get("message_id")
     if not thread_id or not message_id:
@@ -357,10 +487,11 @@ async def update_thread_status(guild: discord.Guild):
 
 
 class CharacterNameModal(discord.ui.Modal, title="輸入角色名稱"):
-    def __init__(self, job: str, is_proxy: bool):
+    def __init__(self, job: str, is_proxy: bool, select_message: discord.Message = None):
         super().__init__()
         self.job = job
         self.is_proxy = is_proxy
+        self.select_message = select_message
         self.char_name_input = discord.ui.TextInput(
             label="角色名稱" + ("（代報）" if is_proxy else ""),
             placeholder="請輸入遊戲內的角色名稱",
@@ -371,10 +502,49 @@ class CharacterNameModal(discord.ui.Modal, title="輸入角色名稱"):
         self.add_item(self.char_name_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await complete_signup(interaction, self.job, self.char_name_input.value.strip(), self.is_proxy)
+        await complete_signup(
+            interaction,
+            self.job,
+            self.char_name_input.value.strip(),
+            self.is_proxy,
+            select_message=self.select_message
+        )
 
 
-async def complete_signup(interaction: discord.Interaction, job: str, char_name: str, is_proxy: bool):
+
+async def cleanup_select_and_response(interaction: discord.Interaction, select_message: discord.Message = None, delay: float = 5):
+    """清除成功/失敗提示與下拉選單訊息（兩者一起消失）"""
+    # 1) 立刻拿掉下拉選單元件，避免使用者再點
+    if select_message is not None:
+        try:
+            await select_message.edit(content="✅ 處理完成，訊息即將關閉…", view=None)
+        except Exception:
+            pass
+
+    await asyncio.sleep(delay)
+
+    # 2) 刪除成功/失敗提示
+    try:
+        await interaction.delete_original_response()
+    except Exception:
+        pass
+
+    # 3) 刪除下拉選單那則訊息（ephemeral 有時會失敗，多試幾種方式）
+    if select_message is not None:
+        try:
+            await select_message.delete()
+        except Exception:
+            try:
+                # 備援：透過 HTTP 直接刪
+                await interaction.client.http.delete_message(select_message.channel.id, select_message.id)
+            except Exception:
+                try:
+                    await select_message.edit(content="（可手動關閉此訊息）", view=None)
+                except Exception:
+                    pass
+
+
+async def complete_signup(interaction: discord.Interaction, job: str, char_name: str, is_proxy: bool, select_message: discord.Message = None):
     guild = interaction.guild
     if not guild:
         await interaction.response.send_message("❌ 只能在伺服器內使用。", ephemeral=True)
@@ -385,26 +555,26 @@ async def complete_signup(interaction: discord.Interaction, job: str, char_name:
 
     if is_deadline_passed(guild_data):
         await interaction.response.send_message("⛔ 報名已截止。", ephemeral=True)
+        await cleanup_select_and_response(interaction, select_message, delay=4)
         return
 
-    normal_cnt, proxy_cnt = count_user_signups(guild_data["signups"], user_id)
-    if is_proxy:
-        if proxy_cnt >= 1:
-            await interaction.response.send_message("❌ 你已經代報過一次了。", ephemeral=True)
-            return
-    else:
+    normal_cnt, proxy_cnt = count_user_entries(
+        guild_data["signups"], guild_data.get("waitlist", {}), user_id
+    )
+    # 一般報名限 1 次；代報無上限
+    if not is_proxy:
         if normal_cnt >= 1:
-            await interaction.response.send_message("❌ 你已經報名過一次了。", ephemeral=True)
+            await interaction.response.send_message("❌ 你已經報名過一次了（含候補）。", ephemeral=True)
+            await cleanup_select_and_response(interaction, select_message, delay=4)
             return
-
-    if len(guild_data["signups"]) >= MAX_PLAYERS:
-        await interaction.response.send_message("❌ 已達總人數上限 60 人。", ephemeral=True)
-        return
 
     job_counts = get_job_counts(guild_data["signups"])
-    if job_counts.get(job, 0) >= MAX_PER_JOB:
-        await interaction.response.send_message(f"❌ **{job}** 已達上限 14 人。", ephemeral=True)
-        return
+    is_waitlist = job_counts.get(job, 0) >= MAX_PER_JOB
+
+    # 總正式人數仍受 60 限制；候補不受此限制
+    if not is_waitlist and len(guild_data["signups"]) >= MAX_PLAYERS:
+        # 正式滿了也進候補
+        is_waitlist = True
 
     info = {
         "job": job,
@@ -415,54 +585,127 @@ async def complete_signup(interaction: discord.Interaction, job: str, char_name:
         "joined_at": datetime.now(TZ).isoformat()
     }
 
-    key = user_id if not is_proxy else f"proxy_{user_id}_{len(guild_data['signups'])}"
-    success = place_player(guild_data, key, info)
-    if not success:
-        info["team"] = None
-        info["slot"] = None
+    key = user_id if not is_proxy else f"proxy_{user_id}_{int(datetime.now().timestamp())}"
 
-    guild_data["signups"][key] = info
-    update_guild_data(guild.id, guild_data)
+    if is_waitlist:
+        # 進入候補
+        guild_data.setdefault("waitlist", {})[key] = info
+        update_guild_data(guild.id, guild_data)
+        await update_thread_status(guild)
+
+        position = len(get_waitlist_by_job(guild_data["waitlist"], job))
+        prefix = "(代報)" if is_proxy else ""
+        await interaction.response.send_message(
+            f"⏳ **已進入候補！**\n"
+            f"角色：{prefix}**{char_name}**\n"
+            f"職業：**{job}**\n"
+            f"目前候補順位：第 **{position}** 位\n"
+            f"（有人取消正式名額時會自動遞補並私訊通知你）",
+            ephemeral=True
+        )
+        try:
+            dm = discord.Embed(
+                title="⏳ 候補成功通知",
+                description=f"你的角色 **{prefix}{char_name}【{job}】** 已進入候補名單",
+                color=discord.Color.orange()
+            )
+            dm.add_field(name="候補順位", value=f"第 {position} 位", inline=True)
+            dm.add_field(name="活動", value=guild_data.get("event_name", ""), inline=True)
+            await interaction.user.send(embed=dm)
+        except discord.Forbidden:
+            pass
+    else:
+        # 正式報名
+        success = place_player(guild_data, key, info)
+        if not success:
+            info["team"] = None
+            info["slot"] = None
+        guild_data["signups"][key] = info
+        update_guild_data(guild.id, guild_data)
+        await update_thread_status(guild)
+
+        remaining = MAX_PLAYERS - len(guild_data["signups"])
+        team_text = ""
+        if info.get("team") is not None:
+            team_text = f"\n隊伍：{TEAM_NAMES[info['team']]} 第 {info['slot']+1} 位"
+        prefix = "(代報)" if is_proxy else ""
+        await interaction.response.send_message(
+            f"✅ **{'代報' if is_proxy else '報名'}成功！**\n"
+            f"角色：{prefix}**{char_name}**\n職業：**{job}**{team_text}\n剩餘正式名額：{remaining}",
+            ephemeral=True
+        )
+        try:
+            thread_id = guild_data.get("thread_id")
+            thread_link = f"https://discord.com/channels/{guild.id}/{thread_id}" if thread_id else ""
+            dm = discord.Embed(
+                title="🎉 報名成功通知" if not is_proxy else "📝 代報成功通知",
+                description=f"{'你已成功報名' if not is_proxy else '你已成功代報'} **{guild_data['event_name']}**",
+                color=discord.Color.green()
+            )
+            dm.add_field(name="角色名稱", value=f"{prefix}{char_name}", inline=True)
+            dm.add_field(name="職業", value=job, inline=True)
+            if team_text:
+                dm.add_field(name="分配隊伍", value=team_text.strip(), inline=False)
+            if thread_link:
+                dm.add_field(name="📢 討論串", value=f"[點此前往]({thread_link})", inline=False)
+            await interaction.user.send(embed=dm)
+        except discord.Forbidden:
+            pass
+
+    await cleanup_select_and_response(interaction, select_message, delay=5)
+
+
+async def cancel_one_entry(interaction: discord.Interaction, src_name: str, key: str, select_message: discord.Message = None):
+    """取消單一筆報名/代報（正式或候補）"""
+    guild = interaction.guild
+    guild_data = get_guild_data(guild.id)
+    src = guild_data.get(src_name, {})
+    info = src.get(key)
+    if not info:
+        await interaction.response.send_message("❌ 找不到該筆資料，可能已被取消。", ephemeral=True)
+        await cleanup_select_and_response(interaction, select_message, delay=4)
+        return
+
+    char_name = info.get("char_name", "未知")
+    job = info.get("job", "")
+    is_proxy = info.get("is_proxy", False)
+    kind = "代報" if is_proxy else "報名"
+
+    src.pop(key, None)
+    if src_name == "signups":
+        remove_player_from_teams(guild_data, key)
+        update_guild_data(guild.id, guild_data)
+        if job:
+            await promote_from_waitlist(guild, guild_data, job)
+    else:
+        update_guild_data(guild.id, guild_data)
+
     await update_thread_status(guild)
 
-    remaining = get_remaining_slots(guild_data["signups"])
-    team_text = ""
-    if info.get("team") is not None:
-        team_text = f"\n隊伍：{TEAM_NAMES[info['team']]} 第 {info['slot']+1} 位"
-
-    prefix = "(代報)" if is_proxy else ""
+    label = f"{'(代報)' if is_proxy else ''}{char_name}【{job}】"
+    status = "正式" if src_name == "signups" else "候補"
     await interaction.response.send_message(
-        f"✅ **{'代報' if is_proxy else '報名'}成功！**\n"
-        f"角色：{prefix}**{char_name}**\n職業：**{job}**{team_text}\n剩餘名額：{remaining}",
+        f"✅ 已取消{kind}：**{label}**（{status}）",
         ephemeral=True
     )
 
     try:
-        thread_id = guild_data.get("thread_id")
-        thread_link = f"https://discord.com/channels/{guild.id}/{thread_id}" if thread_id else ""
         dm = discord.Embed(
-            title="🎉 報名成功通知" if not is_proxy else "📝 代報成功通知",
-            description=f"{'你已成功報名' if not is_proxy else '你已成功代報'} **{guild_data['event_name']}**",
-            color=discord.Color.green()
+            title=f"❌ 取消{kind}通知",
+            color=discord.Color.orange(),
+            description=f"你已取消 **{guild_data.get('event_name')}** 的{kind}\n{label}（{status}）"
         )
-        dm.add_field(name="角色名稱", value=f"{prefix}{char_name}", inline=True)
-        dm.add_field(name="職業", value=job, inline=True)
-        if team_text:
-            dm.add_field(name="分配隊伍", value=team_text.strip(), inline=False)
-        if thread_link:
-            dm.add_field(name="📢 討論串", value=f"[點此前往]({thread_link})", inline=False)
         await interaction.user.send(embed=dm)
     except discord.Forbidden:
         pass
 
-    await asyncio.sleep(7)
-    try:
-        await interaction.delete_original_response()
-    except Exception:
-        pass
+    # select_message：取消代報時的下拉選單訊息；若無則用 interaction.message
+    msg = select_message or interaction.message
+    await cleanup_select_and_response(interaction, msg, delay=5)
 
 
-async def handle_cancel(interaction: discord.Interaction):
+async def handle_cancel_normal(interaction: discord.Interaction):
+    """取消自己的一般報名（正式或候補，通常只有一筆）"""
     guild = interaction.guild
     if not guild:
         return
@@ -473,38 +716,94 @@ async def handle_cancel(interaction: discord.Interaction):
         await interaction.response.send_message("⛔ 報名已截止，無法取消。", ephemeral=True)
         return
 
-    to_remove = [key for key, info in guild_data["signups"].items()
-                 if key == user_id or info.get("owner_id") == user_id]
+    targets = []
+    for src_name in ("signups", "waitlist"):
+        src = guild_data.get(src_name, {})
+        for key, info in list(src.items()):
+            owner = info.get("owner_id", key)
+            if owner == user_id and not info.get("is_proxy", False):
+                targets.append((src_name, key, info))
 
-    if not to_remove:
+    if not targets:
         await interaction.response.send_message("❌ 你目前沒有任何報名紀錄。", ephemeral=True)
         return
 
-    removed_names = []
-    for key in to_remove:
-        info = guild_data["signups"].pop(key)
-        remove_player_from_teams(guild_data, key)
-        removed_names.append(f"{'(代報)' if info.get('is_proxy') else ''}{info.get('char_name')}")
+    # 一般報名通常只有一筆，直接取消第一筆
+    src_name, key, _info = targets[0]
+    await cancel_one_entry(interaction, src_name, key)
 
-    update_guild_data(guild.id, guild_data)
-    await update_thread_status(guild)
 
+async def handle_cancel_proxy_start(interaction: discord.Interaction):
+    """點「取消代報」後，列出可選的代報成員讓使用者指定"""
+    guild = interaction.guild
+    if not guild:
+        return
+    guild_data = get_guild_data(guild.id)
+    user_id = str(interaction.user.id)
+
+    if is_deadline_passed(guild_data):
+        await interaction.response.send_message("⛔ 報名已截止，無法取消。", ephemeral=True)
+        return
+
+    options = []
+    # value 格式：src_name|key
+    for src_name, src_label in (("signups", "正式"), ("waitlist", "候補")):
+        src = guild_data.get(src_name, {})
+        for key, info in src.items():
+            owner = info.get("owner_id", key)
+            if owner != user_id or not info.get("is_proxy", False):
+                continue
+            char_name = info.get("char_name", "未知")
+            job = info.get("job", "")
+            label = f"{char_name}【{job}】（{src_label}）"
+            # Select option label max 100, value max 100
+            value = f"{src_name}|{key}"
+            if len(value) > 100:
+                value = value[:100]
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=value,
+                description=f"{src_label}・點選以取消此代報"
+            ))
+
+    if not options:
+        await interaction.response.send_message("❌ 你目前沒有任何代報紀錄。", ephemeral=True)
+        return
+
+    # Discord 一個 select 最多 25 個選項
+    if len(options) > 25:
+        options = options[:25]
+
+    view = CancelProxySelectView(options)
     await interaction.response.send_message(
-        f"✅ 已取消以下報名：\n" + "\n".join(removed_names), ephemeral=True
+        "請選擇要**取消的代報成員**：",
+        view=view,
+        ephemeral=True
     )
 
-    try:
-        dm = discord.Embed(title="❌ 取消報名通知", color=discord.Color.orange(),
-                           description=f"你已取消 **{guild_data.get('event_name')}** 的報名")
-        await interaction.user.send(embed=dm)
-    except discord.Forbidden:
-        pass
 
-    await asyncio.sleep(6)
-    try:
-        await interaction.delete_original_response()
-    except Exception:
-        pass
+class CancelProxySelectView(discord.ui.View):
+    def __init__(self, options: list):
+        super().__init__(timeout=60)
+        select = discord.ui.Select(
+            placeholder="選擇要取消的代報角色…",
+            options=options,
+            custom_id="cancel_proxy_select"
+        )
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        value = interaction.data["values"][0]
+        if "|" not in value:
+            await interaction.response.send_message("❌ 資料格式錯誤", ephemeral=True)
+            return
+        src_name, key = value.split("|", 1)
+        if src_name not in ("signups", "waitlist"):
+            await interaction.response.send_message("❌ 資料錯誤", ephemeral=True)
+            return
+        # interaction.message = 這則「選擇要取消的代報」下拉選單訊息
+        await cancel_one_entry(interaction, src_name, key, select_message=interaction.message)
 
 
 class JobSelectView(discord.ui.View):
@@ -518,7 +817,8 @@ class JobSelectView(discord.ui.View):
 
     async def on_select(self, interaction: discord.Interaction):
         job = interaction.data["values"][0]
-        await interaction.response.send_modal(CharacterNameModal(job, self.is_proxy))
+        modal = CharacterNameModal(job, self.is_proxy, select_message=interaction.message)
+        await interaction.response.send_modal(modal)
 
 
 class SignupView(discord.ui.View):
@@ -540,6 +840,11 @@ class SignupView(discord.ui.View):
         btn_cancel.callback = self.cancel_callback
         self.add_item(btn_cancel)
 
+        btn_cancel_proxy = discord.ui.Button(label="取消代報", style=discord.ButtonStyle.danger,
+                                             custom_id="btn_cancel_proxy", emoji="⚠️", disabled=disabled)
+        btn_cancel_proxy.callback = self.cancel_proxy_callback
+        self.add_item(btn_cancel_proxy)
+
         btn_refresh = discord.ui.Button(label="重新整理", style=discord.ButtonStyle.secondary,
                                         custom_id="btn_refresh", emoji="🔄")
         btn_refresh.callback = self.refresh_callback
@@ -560,7 +865,10 @@ class SignupView(discord.ui.View):
                                                 view=JobSelectView(is_proxy=True), ephemeral=True)
 
     async def cancel_callback(self, interaction: discord.Interaction):
-        await handle_cancel(interaction)
+        await handle_cancel_normal(interaction)
+
+    async def cancel_proxy_callback(self, interaction: discord.Interaction):
+        await handle_cancel_proxy_start(interaction)
 
     async def refresh_callback(self, interaction: discord.Interaction):
         await update_thread_status(interaction.guild)
@@ -596,7 +904,7 @@ MINUTE_CHOICES = [
 @app_commands.describe(
     名稱="活動名稱",
     對手幫會="對手幫會名稱",
-    約戰日期="約戰日期（格式 YYYYMMDD，例如 20260920）",
+    約戰日期="約戰日期（格式 YYYYMMDD）",
     約戰時="約戰小時",
     約戰分="約戰分鐘",
     截止日期="報名截止日期（格式 YYYYMMDD）",
@@ -645,6 +953,7 @@ async def new_event(
         "deadline": deadline_display,
         "deadline_iso": deadline_dt.isoformat(),
         "signups": {},
+        "waitlist": {},
         "teams": [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)],
         "registration_closed": False,
         "channel_id": channel.id
@@ -658,10 +967,10 @@ async def new_event(
         )
         guild_data["thread_id"] = thread.id
 
-        # 禁止一般成員傳訊息（只能點按鈕）
-        overwrite = thread.overwrites_for(guild.default_role)
-        overwrite.send_messages = False
-        await thread.set_permissions(guild.default_role, overwrite=overwrite)
+        try:
+            await thread.set_permissions(guild.default_role, send_messages=False)
+        except Exception as e:
+            print(f"設定討論串權限時發生問題（可忽略）: {e}")
 
         embed = format_status_embed(guild_data)
         view = SignupView(disabled=False)
@@ -690,9 +999,10 @@ async def export_excel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     guild_data = get_guild_data(interaction.guild.id)
     signups = guild_data.get("signups", {})
+    waitlist = guild_data.get("waitlist", {})
     teams = guild_data.get("teams", [])
 
-    if not signups:
+    if not signups and not waitlist:
         await interaction.followup.send("❌ 目前沒有報名資料", ephemeral=True)
         return
 
@@ -733,21 +1043,27 @@ async def export_excel(interaction: discord.Interaction):
         ws.column_dimensions[get_column_letter(col)].width = 16
 
     ws2 = wb.create_sheet("完整名單")
-    for col, h in enumerate(["序號", "角色名稱", "職業", "代報", "Discord名稱", "ID"], 1):
+    for col, h in enumerate(["序號", "角色名稱", "職業", "代報", "狀態", "Discord名稱", "ID"], 1):
         cell = ws2.cell(row=1, column=col, value=h)
         cell.fill = header_fill
         cell.font = header_font
 
-    for idx, (key, info) in enumerate(signups.items(), 1):
+    idx = 1
+    for key, info in signups.items():
         ws2.append([idx, info.get("char_name"), info.get("job"),
-                    "是" if info.get("is_proxy") else "否", info.get("name"), key])
+                    "是" if info.get("is_proxy") else "否", "正式", info.get("name"), key])
+        idx += 1
+    for key, info in waitlist.items():
+        ws2.append([idx, info.get("char_name"), info.get("job"),
+                    "是" if info.get("is_proxy") else "否", "候補", info.get("name"), key])
+        idx += 1
 
     buffer = BytesIO()
     wb.save(buffer)
     buffer.seek(0)
     filename = f"{guild_data.get('event_name', 'event')}_名單_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.xlsx"
     await interaction.followup.send(
-        content=f"📊 已匯出（共 {len(signups)} 人）",
+        content=f"📊 已匯出（正式 {len(signups)} + 候補 {len(waitlist)} 人）",
         file=discord.File(fp=buffer, filename=filename), ephemeral=True
     )
 
@@ -772,6 +1088,47 @@ async def close_event(interaction: discord.Interaction):
     update_guild_data(interaction.guild.id, guild_data)
     await update_thread_status(interaction.guild)
     await interaction.response.send_message("✅ 已強制關閉報名", ephemeral=True)
+
+
+
+@bot.tree.command(name="who_proxy", description="查詢某個角色是由誰代報的")
+@app_commands.describe(角色名稱="要查詢的角色名稱")
+@has_required_role()
+async def who_proxy(interaction: discord.Interaction, 角色名稱: str):
+    guild_data = get_guild_data(interaction.guild.id)
+    signups = guild_data.get("signups", {})
+    waitlist = guild_data.get("waitlist", {})
+
+    found = None
+    source = None
+    for src_name, src in (("正式", signups), ("候補", waitlist)):
+        for key, info in src.items():
+            if info.get("char_name") == 角色名稱:
+                found = info
+                source = src_name
+                break
+        if found:
+            break
+
+    if not found:
+        await interaction.response.send_message(f"❌ 無該成員「{角色名稱}」", ephemeral=True)
+        return
+
+    if not found.get("is_proxy"):
+        await interaction.response.send_message(
+            f"ℹ️ **{角色名稱}【{found.get('job')}】** 為正式自行報名成員（非代報）。\n狀態：{source}",
+            ephemeral=True
+        )
+        return
+
+    proxy_by = found.get("name", "未知")
+    owner_id = found.get("owner_id", "")
+    await interaction.response.send_message(
+        f"👥 **{角色名稱}【{found.get('job')}】** 是由 **{proxy_by}** 代報的。\n"
+        f"狀態：{source}\n"
+        f"代報者 Discord ID：`{owner_id}`",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="move_member", description="【管理員】調整成員到指定隊伍與位置")
@@ -802,13 +1159,12 @@ async def move_member(
             break
 
     if not found_info:
-        await interaction.followup.send(f"❌ 找不到角色「{角色名稱}」", ephemeral=True)
+        await interaction.followup.send(f"❌ 找不到角色「{角色名稱}」（僅能移動正式名單）", ephemeral=True)
         return
 
     t_idx = 目標隊伍 - 1
     s_idx = 目標位置 - 1
 
-    # 清空目標位置原本的人
     old_p = teams[t_idx][s_idx]
     if old_p:
         for k, inf in signups.items():
@@ -817,7 +1173,6 @@ async def move_member(
                 inf["slot"] = None
 
     remove_player_from_teams(guild_data, found_key)
-
     teams[t_idx][s_idx] = {
         "uid": found_key,
         "char_name": found_info["char_name"],
@@ -857,20 +1212,18 @@ async def on_ready():
     bot.add_view(SignupView(disabled=False))
     try:
         synced = await bot.tree.sync()
-        print(f"✅ 同步 {len(synced)} 個指令")
+        print(f"✅ 同步 {len(synced)} 個指令：")
+        for cmd in synced:
+            print(f"   /{cmd.name}")
     except Exception as e:
-        print(e)
+        print(f"❌ 同步指令失敗: {e}")
     if not check_deadline_task.is_running():
         check_deadline_task.start()
 
 
 if __name__ == "__main__":
-    try:
-        from keep_alive import keep_alive
-        keep_alive()
-        print("✅ keep_alive 已啟動")
-    except ImportError:
-        print("⚠️ 找不到 keep_alive.py，略過")
+    keep_alive()
+    print("✅ keep_alive 已啟動")
 
     token = os.getenv("DISCORD_TOKEN") or ""
     if not token:
