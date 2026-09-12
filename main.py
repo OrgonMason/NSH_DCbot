@@ -699,9 +699,18 @@ async def cancel_one_entry(interaction: discord.Interaction, src_name: str, key:
     except discord.Forbidden:
         pass
 
-    # select_message：取消代報時的下拉選單訊息；若無則用 interaction.message
-    msg = select_message or interaction.message
-    await cleanup_select_and_response(interaction, msg, delay=5)
+    # 注意：不可使用 interaction.message 當備援！
+    # 若從討論串按鈕直接取消，interaction.message 就是「報名狀態+按鈕」那則訊息，
+    # 誤刪會導致整個討論串狀態與按鈕消失。
+    # 只有明確傳入的 ephemeral 下拉選單訊息才可清理。
+    if select_message is not None:
+        await cleanup_select_and_response(interaction, select_message, delay=5)
+    else:
+        await asyncio.sleep(5)
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass
 
 
 async def handle_cancel_normal(interaction: discord.Interaction):
@@ -1087,6 +1096,8 @@ async def event_status(interaction: discord.Interaction):
     if not guild_data.get("event_name"):
         await interaction.response.send_message("❌ 目前沒有進行中的活動", ephemeral=True)
         return
+    # 若討論串狀態訊息被誤刪，這裡會嘗試重新建立
+    await update_thread_status(interaction.guild)
     embed = format_team_status_embed(guild_data)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
