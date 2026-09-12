@@ -881,14 +881,28 @@ class SignupView(discord.ui.View):
 
 
 def has_required_role():
+    """僅允許擁有「管理員」身分組的成員使用斜線指令"""
     async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.guild_permissions.administrator:
-            return True
+        if interaction.guild is None:
+            await interaction.response.send_message("❌ 請在伺服器內使用此指令。", ephemeral=True)
+            return False
+
         role = discord.utils.get(interaction.guild.roles, name=REQUIRED_ROLE_NAME)
-        if role and role in interaction.user.roles:
+        if role is None:
+            await interaction.response.send_message(
+                f"❌ 伺服器中找不到名為 **{REQUIRED_ROLE_NAME}** 的身分組，請先建立該身分組。",
+                ephemeral=True
+            )
+            return False
+
+        member = interaction.user
+        if isinstance(member, discord.Member) and role in member.roles:
             return True
+
         await interaction.response.send_message(
-            f"❌ 你需要擁有 **{REQUIRED_ROLE_NAME}** 身分組才能使用此指令。", ephemeral=True)
+            f"❌ 你需要擁有 **{REQUIRED_ROLE_NAME}** 身分組才能使用此指令。",
+            ephemeral=True
+        )
         return False
     return app_commands.check(predicate)
 
@@ -904,7 +918,7 @@ MINUTE_CHOICES = [
 @app_commands.describe(
     名稱="活動名稱",
     對手幫會="對手幫會名稱",
-    約戰日期="約戰日期（格式 YYYYMMDD）",
+    約戰日期="約戰日期（格式 YYYYMMDD，例如 20260920）",
     約戰時="約戰小時",
     約戰分="約戰分鐘",
     截止日期="報名截止日期（格式 YYYYMMDD）",
@@ -912,7 +926,6 @@ MINUTE_CHOICES = [
     截止分="截止分鐘"
 )
 @app_commands.choices(約戰時=HOUR_CHOICES, 約戰分=MINUTE_CHOICES, 截止時=HOUR_CHOICES, 截止分=MINUTE_CHOICES)
-@app_commands.default_permissions(administrator=True)
 @has_required_role()
 async def new_event(
     interaction: discord.Interaction,
@@ -993,7 +1006,6 @@ async def new_event(
 
 
 @bot.tree.command(name="export_excel", description="【管理員】匯出報名名單 Excel（含分組）")
-@app_commands.default_permissions(administrator=True)
 @has_required_role()
 async def export_excel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -1080,7 +1092,6 @@ async def event_status(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="close_event", description="【管理員】強制關閉報名")
-@app_commands.default_permissions(administrator=True)
 @has_required_role()
 async def close_event(interaction: discord.Interaction):
     guild_data = get_guild_data(interaction.guild.id)
@@ -1137,7 +1148,6 @@ async def who_proxy(interaction: discord.Interaction, 角色名稱: str):
     目標隊伍="1~10（對應一團一隊～三團四隊）",
     目標位置="1~6"
 )
-@app_commands.default_permissions(administrator=True)
 @has_required_role()
 async def move_member(
     interaction: discord.Interaction,
