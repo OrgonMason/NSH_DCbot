@@ -558,6 +558,18 @@ async def complete_signup(interaction: discord.Interaction, job: str, char_name:
         await cleanup_select_and_response(interaction, select_message, delay=4)
         return
 
+    # 角色名稱不可重複（正式 + 候補）
+    for src_name, src in (("正式名單", guild_data.get("signups", {})), ("候補名單", guild_data.get("waitlist", {}))):
+        for info in src.values():
+            if info.get("char_name") == char_name:
+                kind = "代報" if info.get("is_proxy") else "報名"
+                await interaction.response.send_message(
+                    f"❌ 角色名稱 **{char_name}** 已存在於{src_name}（{kind}），不需重複報名。",
+                    ephemeral=True
+                )
+                await cleanup_select_and_response(interaction, select_message, delay=4)
+                return
+
     normal_cnt, proxy_cnt = count_user_entries(
         guild_data["signups"], guild_data.get("waitlist", {}), user_id
     )
@@ -1213,18 +1225,298 @@ async def move_member(
     )
 
 
-@tasks.loop(minutes=1)
+
+# ---------- 管理員：編輯角色 / 取消報名 ----------
+class EditNameModal(discord.ui.Modal, title="編輯角色名稱"):
+    def __init__(self, src_name: str, key: str, old_name: str):
+        super().__init__()
+        self.src_name = src_name
+        self.key = key
+        self.new_name_input = discord.ui.TextInput(
+            label="新的角色名稱",
+            placeholder=f"原名稱：{old_name}",
+            default=old_name,
+            min_length=1,
+            max_length=20,
+            required=True
+        )
+        self.add_item(self.new_name_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_name = self.new_name_input.value.strip()
+        guild_data = get_guild_data(interaction.guild.id)
+
+        # 檢查新名稱是否與其他人重複
+        for sn in ("signups", "waitlist"):
+            for k, info in guild_data.get(sn, {}).items():
+                if k == self.key:
+                    continue
+                if info.get("char_name") == new_name:
+                    await interaction.response.send_message(
+                        f"❌ 角色名稱 **{new_name}** 已被其他人使用。", ephemeral=True
+                    )
+                    return
+
+        src = guild_data.get(self.src_name, {})
+        info = src.get(self.key)
+        if not info:
+            await interaction.response.send_message("❌ 找不到該筆資料。", ephemeral=True)
+            return
+
+        old_name = info.get("char_name", "")
+        info["char_name"] = new_name
+
+        # 同步更新 teams 內的名稱
+        for t in range(NUM_TEAMS):
+            for s in range(SLOTS_PER_TEAM):
+                p = guild_data["teams"][t][s]
+                if p and p.get("uid") == self.key:
+                    p["char_name"] = new_name
+
+        update_guild_data(interaction.guild.id, guild_data)
+        await update_thread_status(interaction.guild)
+        await interaction.response.send_message(
+            f"✅ 已將角色名稱由 **{old_name}** 改為 **{new_name}**",
+            ephemeral=True
+        )
+
+
+def _collect_member_options(guild_data: dict, max_options: int = 25):
+    """收集所有正式+候補成員為 SelectOption，value=src|key"""
+    options = []
+    for src_name, src_label in (("signups", "正式"), ("waitlist", "候補")):
+        for key, info in guild_data.get(src_name, {}).items():
+            char_name = info.get("char_name", "未知")
+            job = info.get("job", "")
+            proxy = "代報" if info.get("is_proxy") else "報名"
+            label = f"{char_name}【{job}】（{src_label}/{proxy}）"
+            value = f"{src_name}|{key}"
+            options.append(discord.SelectOption(label=label[:100], value=value[:100]))
+            if len(options) >= max_options:
+                return options
+    return options
+
+
+class EditRoleActionView(discord.ui.View):
+    """選擇：編輯名稱 或 取消報名/代報"""
+    def __init__(self):
+        super().__init__(timeout=120)
+        select = discord.ui.Select(
+            placeholder="請選擇要執行的操作…",
+            options=[
+                discord.SelectOption(label="編輯角色名稱", value="edit_name", emoji="✏️"),
+                discord.SelectOption(label="取消報名/代報", value="cancel", emoji="⚠️"),
+            ]
+        )
+        select.callback = self.on_action
+        self.add_item(select)
+
+    async def on_action(self, interaction: discord.Interaction):
+        action = interaction.data["values"][0]
+        guild_data = get_guild_data(interaction.guild.id)
+        options = _collect_member_options(guild_data)
+        if not options:
+            await interaction.response.send_message("❌ 目前沒有任何報名資料。", ephemeral=True)
+            return
+        view = EditRoleMemberView(action, options)
+        tip = "請選擇要**編輯名稱**的角色：" if action == "edit_name" else "請選擇要**取消**的角色："
+        await interaction.response.send_message(tip, view=view, ephemeral=True)
+
+
+class EditRoleMemberView(discord.ui.View):
+    def __init__(self, action: str, options: list):
+        super().__init__(timeout=120)
+        self.action = action
+        select = discord.ui.Select(placeholder="選擇角色…", options=options)
+        select.callback = self.on_member
+        self.add_item(select)
+
+    async def on_member(self, interaction: discord.Interaction):
+        value = interaction.data["values"][0]
+        if "|" not in value:
+            await interaction.response.send_message("❌ 資料錯誤", ephemeral=True)
+            return
+        src_name, key = value.split("|", 1)
+        guild_data = get_guild_data(interaction.guild.id)
+        info = guild_data.get(src_name, {}).get(key)
+        if not info:
+            await interaction.response.send_message("❌ 找不到該成員。", ephemeral=True)
+            return
+
+        if self.action == "edit_name":
+            await interaction.response.send_modal(
+                EditNameModal(src_name, key, info.get("char_name", ""))
+            )
+            return
+
+        # 取消報名/代報（管理員代為取消）
+        char_name = info.get("char_name", "未知")
+        job = info.get("job", "")
+        is_proxy = info.get("is_proxy", False)
+        kind = "代報" if is_proxy else "報名"
+
+        guild_data[src_name].pop(key, None)
+        if src_name == "signups":
+            remove_player_from_teams(guild_data, key)
+            update_guild_data(interaction.guild.id, guild_data)
+            if job:
+                await promote_from_waitlist(interaction.guild, guild_data, job)
+        else:
+            update_guild_data(interaction.guild.id, guild_data)
+
+        await update_thread_status(interaction.guild)
+        status = "正式" if src_name == "signups" else "候補"
+        await interaction.response.send_message(
+            f"✅ 已取消 **{'(代報)' if is_proxy else ''}{char_name}【{job}】**（{status}）",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="edit_role", description="【管理員】編輯角色名稱或取消報名/代報")
+@has_required_role()
+async def edit_role(interaction: discord.Interaction):
+    guild_data = get_guild_data(interaction.guild.id)
+    if not guild_data.get("event_name"):
+        await interaction.response.send_message("❌ 目前沒有進行中的活動。", ephemeral=True)
+        return
+    if not guild_data.get("signups") and not guild_data.get("waitlist"):
+        await interaction.response.send_message("❌ 目前沒有任何報名資料。", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        "請選擇要執行的操作：",
+        view=EditRoleActionView(),
+        ephemeral=True
+    )
+
+
+# ---------- 提醒功能 ----------
+def parse_reminder_time(s: str):
+    """解析 YYYYMMDDHHMM → datetime（台北時區）"""
+    try:
+        s = s.strip().replace("-", "").replace(" ", "").replace(":", "")
+        if len(s) != 12:
+            return None
+        year = int(s[0:4])
+        month = int(s[4:6])
+        day = int(s[6:8])
+        hour = int(s[8:10])
+        minute = int(s[10:12])
+        return datetime(year, month, day, hour, minute, tzinfo=TZ)
+    except Exception:
+        return None
+
+
+@bot.tree.command(name="reminder", description="【管理員】設定定時提醒（台北時間）")
+@app_commands.describe(
+    提醒內容="要提醒的文字內容",
+    提醒時間="格式 YYYYMMDDHHMM（24小時制，台北時間），例如 202609152130"
+)
+@has_required_role()
+async def reminder_cmd(interaction: discord.Interaction, 提醒內容: str, 提醒時間: str):
+    dt = parse_reminder_time(提醒時間)
+    if dt is None:
+        await interaction.response.send_message(
+            "❌ 時間格式錯誤，請使用 **YYYYMMDDHHMM**（例如 `202609152130` 表示 2026-09-15 21:30）",
+            ephemeral=True
+        )
+        return
+
+    now = datetime.now(TZ)
+    if dt <= now:
+        await interaction.response.send_message("❌ 提醒時間必須是未來的時間。", ephemeral=True)
+        return
+
+    guild_data = get_guild_data(interaction.guild.id)
+    reminders = guild_data.setdefault("reminders", [])
+    rid = f"{int(now.timestamp())}_{interaction.user.id}"
+    reminders.append({
+        "id": rid,
+        "content": 提醒內容,
+        "remind_at": dt.isoformat(),
+        "user_id": str(interaction.user.id),
+        "channel_id": str(interaction.channel.id) if interaction.channel else None,
+        "done": False
+    })
+    update_guild_data(interaction.guild.id, guild_data)
+
+    display = format_datetime_display(dt)
+    await interaction.response.send_message(
+        f"✅ 提醒已設定\n"
+        f"⏰ 時間：{display}\n"
+        f"📝 內容：{提醒內容}\n"
+        f"到時會在此頻道標記你並送出提醒。",
+        ephemeral=True
+    )
+
+
+async def process_reminders():
+    """檢查並發送到期提醒"""
+    data = load_data()
+    now = datetime.now(TZ)
+    for gid, gdata in data.items():
+        reminders = gdata.get("reminders") or []
+        if not reminders:
+            continue
+        changed = False
+        remaining = []
+        guild = bot.get_guild(int(gid))
+        for r in reminders:
+            if r.get("done"):
+                continue
+            try:
+                remind_at = datetime.fromisoformat(r["remind_at"])
+            except Exception:
+                remaining.append(r)
+                continue
+            if now < remind_at:
+                remaining.append(r)
+                continue
+            # 到期：發送提醒
+            channel = None
+            if guild and r.get("channel_id"):
+                channel = guild.get_channel(int(r["channel_id"]))
+                if channel is None:
+                    try:
+                        channel = await bot.fetch_channel(int(r["channel_id"]))
+                    except Exception:
+                        channel = None
+            if channel is not None:
+                try:
+                    mention = f"<@{r['user_id']}>"
+                    embed = discord.Embed(
+                        title="⏰ 提醒通知",
+                        description=r.get("content", ""),
+                        color=discord.Color.gold()
+                    )
+                    embed.add_field(name="設定者", value=mention, inline=True)
+                    embed.set_footer(text="由 /reminder 設定")
+                    await channel.send(content=mention, embed=embed)
+                except Exception as e:
+                    print(f"發送提醒失敗: {e}")
+            changed = True
+            # 不加入 remaining = 已完成並移除
+        if changed or len(remaining) != len(reminders):
+            gdata["reminders"] = remaining
+            update_guild_data(int(gid), gdata)
+
+
+@tasks.loop(minutes=30)
 async def check_deadline_task():
     data = load_data()
     for gid, gdata in data.items():
         if gdata.get("registration_closed"):
-            continue
-        if is_deadline_passed(gdata):
+            pass
+        elif is_deadline_passed(gdata):
             gdata["registration_closed"] = True
             update_guild_data(int(gid), gdata)
             guild = bot.get_guild(int(gid))
             if guild:
                 await update_thread_status(guild)
+    # 處理到期提醒
+    try:
+        await process_reminders()
+    except Exception as e:
+        print(f"處理提醒時發生錯誤: {e}")
 
 
 @bot.event
