@@ -1281,79 +1281,38 @@ class EditNameModal(discord.ui.Modal, title="編輯角色名稱"):
         )
 
 
-def _collect_member_options(guild_data: dict, max_options: int = 25):
-    """收集所有正式+候補成員為 SelectOption，value=src|key"""
-    options = []
-    for src_name, src_label in (("signups", "正式"), ("waitlist", "候補")):
+
+def _find_member_by_char_name(guild_data: dict, char_name: str):
+    """依角色名稱尋找 (src_name, key, info)，找不到回傳 None"""
+    for src_name in ("signups", "waitlist"):
         for key, info in guild_data.get(src_name, {}).items():
-            char_name = info.get("char_name", "未知")
-            job = info.get("job", "")
-            proxy = "代報" if info.get("is_proxy") else "報名"
-            label = f"{char_name}【{job}】（{src_label}/{proxy}）"
-            value = f"{src_name}|{key}"
-            options.append(discord.SelectOption(label=label[:100], value=value[:100]))
-            if len(options) >= max_options:
-                return options
-    return options
+            if info.get("char_name") == char_name:
+                return src_name, key, info
+    return None
 
 
-class EditRoleActionView(discord.ui.View):
-    """選擇：編輯名稱 或 取消報名/代報"""
+class AdminCancelByNameModal(discord.ui.Modal, title="取消報名/代報"):
     def __init__(self):
-        super().__init__(timeout=120)
-        select = discord.ui.Select(
-            placeholder="請選擇要執行的操作…",
-            options=[
-                discord.SelectOption(label="編輯角色名稱", value="edit_name", emoji="✏️"),
-                discord.SelectOption(label="取消報名/代報", value="cancel", emoji="⚠️"),
-            ]
+        super().__init__()
+        self.char_input = discord.ui.TextInput(
+            label="要取消的角色名稱",
+            placeholder="請輸入完整角色名稱",
+            min_length=1,
+            max_length=20,
+            required=True
         )
-        select.callback = self.on_action
-        self.add_item(select)
+        self.add_item(self.char_input)
 
-    async def on_action(self, interaction: discord.Interaction):
-        action = interaction.data["values"][0]
+    async def on_submit(self, interaction: discord.Interaction):
+        char_name = self.char_input.value.strip()
         guild_data = get_guild_data(interaction.guild.id)
-        options = _collect_member_options(guild_data)
-        if not options:
-            await interaction.response.send_message("❌ 目前沒有任何報名資料。", ephemeral=True)
+        found = _find_member_by_char_name(guild_data, char_name)
+        if not found:
+            await interaction.response.send_message(f"❌ 找不到角色「{char_name}」", ephemeral=True)
             return
-        view = EditRoleMemberView(action, options)
-        tip = "請選擇要**編輯名稱**的角色：" if action == "edit_name" else "請選擇要**取消**的角色："
-        await interaction.response.send_message(tip, view=view, ephemeral=True)
-
-
-class EditRoleMemberView(discord.ui.View):
-    def __init__(self, action: str, options: list):
-        super().__init__(timeout=120)
-        self.action = action
-        select = discord.ui.Select(placeholder="選擇角色…", options=options)
-        select.callback = self.on_member
-        self.add_item(select)
-
-    async def on_member(self, interaction: discord.Interaction):
-        value = interaction.data["values"][0]
-        if "|" not in value:
-            await interaction.response.send_message("❌ 資料錯誤", ephemeral=True)
-            return
-        src_name, key = value.split("|", 1)
-        guild_data = get_guild_data(interaction.guild.id)
-        info = guild_data.get(src_name, {}).get(key)
-        if not info:
-            await interaction.response.send_message("❌ 找不到該成員。", ephemeral=True)
-            return
-
-        if self.action == "edit_name":
-            await interaction.response.send_modal(
-                EditNameModal(src_name, key, info.get("char_name", ""))
-            )
-            return
-
-        # 取消報名/代報（管理員代為取消）
-        char_name = info.get("char_name", "未知")
+        src_name, key, info = found
         job = info.get("job", "")
         is_proxy = info.get("is_proxy", False)
-        kind = "代報" if is_proxy else "報名"
 
         guild_data[src_name].pop(key, None)
         if src_name == "signups":
@@ -1370,6 +1329,82 @@ class EditRoleMemberView(discord.ui.View):
             f"✅ 已取消 **{'(代報)' if is_proxy else ''}{char_name}【{job}】**（{status}）",
             ephemeral=True
         )
+
+
+class AdminEditNameByInputModal(discord.ui.Modal, title="編輯角色名稱"):
+    def __init__(self):
+        super().__init__()
+        self.old_input = discord.ui.TextInput(
+            label="目前的角色名稱",
+            placeholder="請輸入要修改的角色名稱",
+            min_length=1,
+            max_length=20,
+            required=True
+        )
+        self.new_input = discord.ui.TextInput(
+            label="新的角色名稱",
+            placeholder="請輸入新的角色名稱",
+            min_length=1,
+            max_length=20,
+            required=True
+        )
+        self.add_item(self.old_input)
+        self.add_item(self.new_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        old_name = self.old_input.value.strip()
+        new_name = self.new_input.value.strip()
+        guild_data = get_guild_data(interaction.guild.id)
+
+        found = _find_member_by_char_name(guild_data, old_name)
+        if not found:
+            await interaction.response.send_message(f"❌ 找不到角色「{old_name}」", ephemeral=True)
+            return
+
+        # 新名稱不可與其他人重複
+        other = _find_member_by_char_name(guild_data, new_name)
+        if other and not (other[0] == found[0] and other[1] == found[1]):
+            await interaction.response.send_message(
+                f"❌ 角色名稱 **{new_name}** 已被其他人使用。", ephemeral=True
+            )
+            return
+
+        src_name, key, info = found
+        info["char_name"] = new_name
+        for t in range(NUM_TEAMS):
+            for s in range(SLOTS_PER_TEAM):
+                p = guild_data["teams"][t][s]
+                if p and p.get("uid") == key:
+                    p["char_name"] = new_name
+
+        update_guild_data(interaction.guild.id, guild_data)
+        await update_thread_status(interaction.guild)
+        await interaction.response.send_message(
+            f"✅ 已將角色名稱由 **{old_name}** 改為 **{new_name}**",
+            ephemeral=True
+        )
+
+
+class EditRoleActionView(discord.ui.View):
+    """選擇：編輯名稱 或 取消報名/代報，再以輸入方式指定角色"""
+    def __init__(self):
+        super().__init__(timeout=120)
+        select = discord.ui.Select(
+            placeholder="請選擇要執行的操作…",
+            options=[
+                discord.SelectOption(label="編輯角色名稱", value="edit_name", emoji="✏️"),
+                discord.SelectOption(label="取消報名/代報", value="cancel", emoji="⚠️"),
+            ]
+        )
+        select.callback = self.on_action
+        self.add_item(select)
+
+    async def on_action(self, interaction: discord.Interaction):
+        action = interaction.data["values"][0]
+        if action == "edit_name":
+            await interaction.response.send_modal(AdminEditNameByInputModal())
+        else:
+            await interaction.response.send_modal(AdminCancelByNameModal())
 
 
 @bot.tree.command(name="edit_role", description="【管理員】編輯角色名稱或取消報名/代報")
@@ -1500,7 +1535,7 @@ async def process_reminders():
             update_guild_data(int(gid), gdata)
 
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=5)
 async def check_deadline_task():
     data = load_data()
     for gid, gdata in data.items():
@@ -1512,7 +1547,11 @@ async def check_deadline_task():
             guild = bot.get_guild(int(gid))
             if guild:
                 await update_thread_status(guild)
-    # 處理到期提醒
+
+
+@tasks.loop(minutes=5)
+async def check_reminder_task():
+    """每 5 分鐘檢查一次到期提醒"""
     try:
         await process_reminders()
     except Exception as e:
@@ -1548,6 +1587,9 @@ async def on_ready():
 
     if not check_deadline_task.is_running():
         check_deadline_task.start()
+    if not check_reminder_task.is_running():
+        check_reminder_task.start()
+        print("✅ 提醒與截止檢查任務已啟動（每 5 分鐘）")
 
 
 if __name__ == "__main__":
