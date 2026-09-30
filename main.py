@@ -77,37 +77,140 @@ def save_data(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def get_guild_data(guild_id: int) -> dict:
+def _empty_event() -> dict:
+    return {
+        "event_name": None,
+        "event_date": None,
+        "opponent": None,
+        "deadline": None,
+        "deadline_iso": None,
+        "channel_id": None,
+        "thread_id": None,
+        "message_id": None,
+        "signups": {},
+        "waitlist": {},
+        "teams": [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)],
+        "registration_closed": False,
+    }
+
+
+def get_guild_root(guild_id: int) -> dict:
+    """伺服器層資料：可同時存在多個活動（以 thread_id 區分）+ reminders"""
     data = load_data()
     gid = str(guild_id)
     if gid not in data:
-        data[gid] = {
-            "event_name": None,
-            "event_date": None,
-            "opponent": None,
-            "deadline": None,
-            "deadline_iso": None,
-            "channel_id": None,
-            "thread_id": None,
-            "message_id": None,
-            "signups": {},       # 正式報名
-            "waitlist": {},      # 候補 {key: info}
-            "teams": [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)],
-            "registration_closed": False
-        }
+        data[gid] = {"events": {}, "reminders": []}
         save_data(data)
+        return data[gid]
+
     g = data[gid]
-    if "teams" not in g:
-        g["teams"] = [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)]
-    if "waitlist" not in g:
-        g["waitlist"] = {}
+    # 舊格式遷移：單一活動 → events[thread_id]
+    if "events" not in g:
+        reminders = g.get("reminders", [])
+        if g.get("thread_id"):
+            tid = str(g["thread_id"])
+            event = {k: v for k, v in g.items() if k != "reminders"}
+            if "teams" not in event:
+                event["teams"] = [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)]
+            if "waitlist" not in event:
+                event["waitlist"] = {}
+            event.setdefault("registration_closed", False)
+            g = {"events": {tid: event}, "reminders": reminders}
+        else:
+            g = {"events": {}, "reminders": reminders}
+        data[gid] = g
+        save_data(data)
+    g.setdefault("events", {})
+    g.setdefault("reminders", [])
     return g
 
 
-def update_guild_data(guild_id: int, guild_data: dict):
+def save_guild_root(guild_id: int, root: dict):
     data = load_data()
-    data[str(guild_id)] = guild_data
+    data[str(guild_id)] = root
     save_data(data)
+
+
+def get_event_data(guild_id: int, thread_id) -> Optional[dict]:
+    """取得特定討論串的活動資料"""
+    if thread_id is None:
+        return None
+    root = get_guild_root(guild_id)
+    ev = root["events"].get(str(thread_id))
+    if not ev:
+        return None
+    if "teams" not in ev:
+        ev["teams"] = [[None] * SLOTS_PER_TEAM for _ in range(NUM_TEAMS)]
+    if "waitlist" not in ev:
+        ev["waitlist"] = {}
+    ev.setdefault("registration_closed", False)
+    return ev
+
+
+def update_event_data(guild_id: int, thread_id, event_data: dict):
+    root = get_guild_root(guild_id)
+    event_data["thread_id"] = int(thread_id) if thread_id else event_data.get("thread_id")
+    root["events"][str(thread_id)] = event_data
+    save_guild_root(guild_id, root)
+
+
+def resolve_thread_id(interaction: discord.Interaction) -> Optional[int]:
+    """從互動所在頻道解析討論串 ID"""
+    ch = interaction.channel
+    if ch is None:
+        return None
+    if isinstance(ch, discord.Thread):
+        return ch.id
+    # 按鈕所在訊息的頻道
+    if getattr(interaction, "message", None) is not None:
+        mc = interaction.message.channel
+        if isinstance(mc, discord.Thread):
+            return mc.id
+    return None
+
+
+def get_event_for_interaction(interaction: discord.Interaction) -> Optional[tuple]:
+    """回傳 (event_data, thread_id) 或 None"""
+    if interaction.guild is None:
+        return None
+    tid = resolve_thread_id(interaction)
+    if tid is None:
+        return None
+    ev = get_event_data(interaction.guild.id, tid)
+    if ev is None:
+        return None
+    return ev, tid
+
+
+# 相容舊程式：get_guild_data / update_guild_data 改為「需指定 thread_id」
+def get_guild_data(guild_id: int, thread_id=None) -> dict:
+    """
+    若有 thread_id → 回傳該活動。
+    若無 thread_id 且只有一個活動 → 回傳該活動（相容）。
+    若無 thread_id 且多個活動 → 回傳空活動結構（避免誤寫到錯活動，呼叫端應改傳 thread_id）。
+    """
+    root = get_guild_root(guild_id)
+    events = root.get("events", {})
+    if thread_id is not None:
+        ev = get_event_data(guild_id, thread_id)
+        return ev if ev is not None else _empty_event()
+    if len(events) == 1:
+        only_tid = next(iter(events.keys()))
+        return get_event_data(guild_id, only_tid) or _empty_event()
+    if len(events) == 0:
+        return _empty_event()
+    # 多活動且未指定 thread：回傳空，避免串到錯的活動
+    return _empty_event()
+
+
+def update_guild_data(guild_id: int, guild_data: dict, thread_id=None):
+    """寫回活動。優先使用參數 thread_id，否則用 guild_data['thread_id']"""
+    tid = thread_id or guild_data.get("thread_id")
+    if not tid:
+        # 無法定位活動，不寫入以免覆蓋
+        print("⚠️ update_guild_data: 缺少 thread_id，已略過寫入")
+        return
+    update_event_data(guild_id, tid, guild_data)
 
 
 def format_datetime_display(dt: datetime) -> str:
@@ -293,8 +396,9 @@ def remove_player_from_teams(guild_data: dict, key: str):
                 guild_data["teams"][t][s] = None
 
 
-async def promote_from_waitlist(guild: discord.Guild, guild_data: dict, job: str):
+async def promote_from_waitlist(guild: discord.Guild, guild_data: dict, job: str, thread_id=None):
     """當正式名額有空缺時，把該職業候補第1位升上正式"""
+    thread_id = thread_id or guild_data.get("thread_id")
     waitlist = guild_data.get("waitlist", {})
     items = get_waitlist_by_job(waitlist, job)
     if not items:
@@ -310,8 +414,11 @@ async def promote_from_waitlist(guild: discord.Guild, guild_data: dict, job: str
         info["team"] = None
         info["slot"] = None
     guild_data["signups"][key] = info
-    update_guild_data(guild.id, guild_data)
-    await update_thread_status(guild)
+    if thread_id:
+        update_event_data(guild.id, thread_id, guild_data)
+        await update_thread_status(guild, thread_id)
+    else:
+        update_guild_data(guild.id, guild_data)
 
     # 私訊通知升上正式
     try:
@@ -456,24 +563,28 @@ def format_team_status_embed(guild_data: dict) -> discord.Embed:
     return embed
 
 
-async def update_thread_status(guild: discord.Guild):
-    guild_data = get_guild_data(guild.id)
+async def update_thread_status(guild: discord.Guild, thread_id=None):
+    """更新指定討論串的狀態訊息。thread_id 必填（多活動時）。"""
+    if thread_id is None:
+        return
+    guild_data = get_event_data(guild.id, thread_id)
+    if not guild_data:
+        return
     # 自動補上未分配隊伍的成員
     if assign_unassigned_players(guild_data):
-        update_guild_data(guild.id, guild_data)
-    thread_id = guild_data.get("thread_id")
+        update_event_data(guild.id, thread_id, guild_data)
     message_id = guild_data.get("message_id")
-    if not thread_id or not message_id:
+    if not message_id:
         return
     try:
-        thread = guild.get_thread(thread_id) or await bot.fetch_channel(thread_id)
+        thread = guild.get_thread(int(thread_id)) or await bot.fetch_channel(int(thread_id))
     except Exception:
         return
 
     closed = is_deadline_passed(guild_data)
     if closed and not guild_data.get("registration_closed"):
         guild_data["registration_closed"] = True
-        update_guild_data(guild.id, guild_data)
+        update_event_data(guild.id, thread_id, guild_data)
 
     embed = format_status_embed(guild_data)
     view = SignupView(disabled=closed)
@@ -483,7 +594,7 @@ async def update_thread_status(guild: discord.Guild):
     except Exception:
         new_msg = await thread.send(embed=embed, view=view)
         guild_data["message_id"] = new_msg.id
-        update_guild_data(guild.id, guild_data)
+        update_event_data(guild.id, thread_id, guild_data)
 
 
 class CharacterNameModal(discord.ui.Modal, title="輸入角色名稱"):
@@ -550,7 +661,11 @@ async def complete_signup(interaction: discord.Interaction, job: str, char_name:
         await interaction.response.send_message("❌ 只能在伺服器內使用。", ephemeral=True)
         return
 
-    guild_data = get_guild_data(guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message("❌ 請在對應的活動討論串內操作。", ephemeral=True)
+        return
+    guild_data, thread_id = resolved
     user_id = str(interaction.user.id)
 
     if is_deadline_passed(guild_data):
@@ -602,8 +717,8 @@ async def complete_signup(interaction: discord.Interaction, job: str, char_name:
     if is_waitlist:
         # 進入候補
         guild_data.setdefault("waitlist", {})[key] = info
-        update_guild_data(guild.id, guild_data)
-        await update_thread_status(guild)
+        update_event_data(guild.id, thread_id, guild_data)
+        await update_thread_status(guild, thread_id)
 
         position = len(get_waitlist_by_job(guild_data["waitlist"], job))
         prefix = "(代報)" if is_proxy else ""
@@ -633,8 +748,8 @@ async def complete_signup(interaction: discord.Interaction, job: str, char_name:
             info["team"] = None
             info["slot"] = None
         guild_data["signups"][key] = info
-        update_guild_data(guild.id, guild_data)
-        await update_thread_status(guild)
+        update_event_data(guild.id, thread_id, guild_data)
+        await update_thread_status(guild, thread_id)
 
         remaining = MAX_PLAYERS - len(guild_data["signups"])
         team_text = ""
@@ -670,7 +785,11 @@ async def complete_signup(interaction: discord.Interaction, job: str, char_name:
 async def cancel_one_entry(interaction: discord.Interaction, src_name: str, key: str, select_message: discord.Message = None):
     """取消單一筆報名/代報（正式或候補）"""
     guild = interaction.guild
-    guild_data = get_guild_data(guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message("❌ 請在對應的活動討論串內操作。", ephemeral=True)
+        return
+    guild_data, thread_id = resolved
     src = guild_data.get(src_name, {})
     info = src.get(key)
     if not info:
@@ -686,13 +805,13 @@ async def cancel_one_entry(interaction: discord.Interaction, src_name: str, key:
     src.pop(key, None)
     if src_name == "signups":
         remove_player_from_teams(guild_data, key)
-        update_guild_data(guild.id, guild_data)
+        update_event_data(guild.id, thread_id, guild_data)
         if job:
-            await promote_from_waitlist(guild, guild_data, job)
+            await promote_from_waitlist(guild, guild_data, job, thread_id)
     else:
-        update_guild_data(guild.id, guild_data)
+        update_event_data(guild.id, thread_id, guild_data)
 
-    await update_thread_status(guild)
+    await update_thread_status(guild, thread_id)
 
     label = f"{'(代報)' if is_proxy else ''}{char_name}【{job}】"
     status = "正式" if src_name == "signups" else "候補"
@@ -730,7 +849,11 @@ async def handle_cancel_normal(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
         return
-    guild_data = get_guild_data(guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message("❌ 請在對應的活動討論串內操作。", ephemeral=True)
+        return
+    guild_data, _thread_id = resolved
     user_id = str(interaction.user.id)
 
     if is_deadline_passed(guild_data):
@@ -759,7 +882,11 @@ async def handle_cancel_proxy_start(interaction: discord.Interaction):
     guild = interaction.guild
     if not guild:
         return
-    guild_data = get_guild_data(guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message("❌ 請在對應的活動討論串內操作。", ephemeral=True)
+        return
+    guild_data, _thread_id = resolved
     user_id = str(interaction.user.id)
 
     if is_deadline_passed(guild_data):
@@ -872,14 +999,24 @@ class SignupView(discord.ui.View):
         self.add_item(btn_refresh)
 
     async def signup_callback(self, interaction: discord.Interaction):
-        if is_deadline_passed(get_guild_data(interaction.guild.id)):
+        resolved = get_event_for_interaction(interaction)
+        if not resolved:
+            await interaction.response.send_message("❌ 請在對應的活動討論串內操作。", ephemeral=True)
+            return
+        guild_data, _tid = resolved
+        if is_deadline_passed(guild_data):
             await interaction.response.send_message("⛔ 報名已截止。", ephemeral=True)
             return
         await interaction.response.send_message("請選擇要報名的職業：",
                                                 view=JobSelectView(is_proxy=False), ephemeral=True)
 
     async def proxy_callback(self, interaction: discord.Interaction):
-        if is_deadline_passed(get_guild_data(interaction.guild.id)):
+        resolved = get_event_for_interaction(interaction)
+        if not resolved:
+            await interaction.response.send_message("❌ 請在對應的活動討論串內操作。", ephemeral=True)
+            return
+        guild_data, _tid = resolved
+        if is_deadline_passed(guild_data):
             await interaction.response.send_message("⛔ 報名已截止。", ephemeral=True)
             return
         await interaction.response.send_message("請選擇要**代報**的職業：",
@@ -892,7 +1029,12 @@ class SignupView(discord.ui.View):
         await handle_cancel_proxy_start(interaction)
 
     async def refresh_callback(self, interaction: discord.Interaction):
-        await update_thread_status(interaction.guild)
+        resolved = get_event_for_interaction(interaction)
+        if not resolved:
+            await interaction.response.send_message("❌ 請在對應的活動討論串內操作。", ephemeral=True)
+            return
+        _gd, tid = resolved
+        await update_thread_status(interaction.guild, tid)
         await interaction.response.send_message("✅ 已重新整理", ephemeral=True)
         await asyncio.sleep(3)
         try:
@@ -979,7 +1121,8 @@ async def new_event(
         await interaction.followup.send("❌ 請在文字頻道使用", ephemeral=True)
         return
 
-    guild_data = get_guild_data(guild.id)
+    # 每個討論串獨立一份活動資料，不會覆蓋其他活動
+    guild_data = _empty_event()
     guild_data.update({
         "event_name": 名稱,
         "opponent": 對手幫會,
@@ -1020,8 +1163,12 @@ async def new_event(
             embed=embed, view=view
         )
         guild_data["message_id"] = msg.id
-        update_guild_data(guild.id, guild_data)
-        await interaction.followup.send(f"✅ 活動已建立！\n討論串：{thread.mention}", ephemeral=True)
+        update_event_data(guild.id, thread.id, guild_data)
+        await interaction.followup.send(
+            f"✅ 活動已建立！\n討論串：{thread.mention}\n"
+            f"（此活動與其他討論串互相獨立）",
+            ephemeral=True
+        )
     except Exception as e:
         await interaction.followup.send(f"❌ 建立失敗：{e}", ephemeral=True)
 
@@ -1030,7 +1177,14 @@ async def new_event(
 @has_required_role()
 async def export_excel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    guild_data = get_guild_data(interaction.guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.followup.send(
+            "❌ 請在**要匯出的活動討論串內**使用此指令。",
+            ephemeral=True
+        )
+        return
+    guild_data, _thread_id = resolved
     signups = guild_data.get("signups", {})
     waitlist = guild_data.get("waitlist", {})
     teams = guild_data.get("teams", [])
@@ -1104,12 +1258,18 @@ async def export_excel(interaction: discord.Interaction):
 @bot.tree.command(name="event_status", description="查看目前隊伍分配狀態")
 @has_required_role()
 async def event_status(interaction: discord.Interaction):
-    guild_data = get_guild_data(interaction.guild.id)
-    if not guild_data.get("event_name"):
-        await interaction.response.send_message("❌ 目前沒有進行中的活動", ephemeral=True)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message(
+            "❌ 請在**活動討論串內**使用此指令，以查看該場活動的隊伍狀態。",
+            ephemeral=True
+        )
         return
-    # 若討論串狀態訊息被誤刪，這裡會嘗試重新建立
-    await update_thread_status(interaction.guild)
+    guild_data, thread_id = resolved
+    if not guild_data.get("event_name"):
+        await interaction.response.send_message("❌ 此討論串沒有進行中的活動", ephemeral=True)
+        return
+    await update_thread_status(interaction.guild, thread_id)
     embed = format_team_status_embed(guild_data)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1117,11 +1277,19 @@ async def event_status(interaction: discord.Interaction):
 @bot.tree.command(name="close_event", description="【管理員】強制關閉報名")
 @has_required_role()
 async def close_event(interaction: discord.Interaction):
-    guild_data = get_guild_data(interaction.guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message(
+            "❌ 請在**要關閉的活動討論串內**使用此指令（每個討論串獨立截止）。",
+            ephemeral=True
+        )
+        return
+    guild_data, thread_id = resolved
     guild_data["registration_closed"] = True
-    update_guild_data(interaction.guild.id, guild_data)
-    await update_thread_status(interaction.guild)
-    await interaction.response.send_message("✅ 已強制關閉報名", ephemeral=True)
+    update_event_data(interaction.guild.id, thread_id, guild_data)
+    await update_thread_status(interaction.guild, thread_id)
+    name = guild_data.get("event_name") or "此活動"
+    await interaction.response.send_message(f"✅ 已強制關閉「**{name}**」的報名（不影響其他討論串）", ephemeral=True)
 
 
 
@@ -1129,7 +1297,14 @@ async def close_event(interaction: discord.Interaction):
 @app_commands.describe(角色名稱="要查詢的角色名稱")
 @has_required_role()
 async def who_proxy(interaction: discord.Interaction, 角色名稱: str):
-    guild_data = get_guild_data(interaction.guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message(
+            "❌ 請在**活動討論串內**使用此指令。",
+            ephemeral=True
+        )
+        return
+    guild_data, _tid = resolved
     signups = guild_data.get("signups", {})
     waitlist = guild_data.get("waitlist", {})
 
@@ -1179,7 +1354,14 @@ async def move_member(
     目標位置: app_commands.Range[int, 1, 6]
 ):
     await interaction.response.defer(ephemeral=True)
-    guild_data = get_guild_data(interaction.guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.followup.send(
+            "❌ 請在**活動討論串內**使用此指令。",
+            ephemeral=True
+        )
+        return
+    guild_data, thread_id = resolved
     teams = guild_data["teams"]
     signups = guild_data["signups"]
 
@@ -1216,8 +1398,8 @@ async def move_member(
     found_info["team"] = t_idx
     found_info["slot"] = s_idx
 
-    update_guild_data(interaction.guild.id, guild_data)
-    await update_thread_status(interaction.guild)
+    update_event_data(interaction.guild.id, thread_id, guild_data)
+    await update_thread_status(interaction.guild, thread_id)
 
     await interaction.followup.send(
         f"✅ 已將 **{角色名稱}** 移動到 **{TEAM_NAMES[t_idx]}** 的第 **{目標位置}** 位置",
@@ -1244,7 +1426,11 @@ class EditNameModal(discord.ui.Modal, title="編輯角色名稱"):
 
     async def on_submit(self, interaction: discord.Interaction):
         new_name = self.new_name_input.value.strip()
-        guild_data = get_guild_data(interaction.guild.id)
+        resolved = get_event_for_interaction(interaction)
+        if not resolved:
+            await interaction.response.send_message("❌ 請在活動討論串內操作。", ephemeral=True)
+            return
+        guild_data, thread_id = resolved
 
         # 檢查新名稱是否與其他人重複
         for sn in ("signups", "waitlist"):
@@ -1273,8 +1459,8 @@ class EditNameModal(discord.ui.Modal, title="編輯角色名稱"):
                 if p and p.get("uid") == self.key:
                     p["char_name"] = new_name
 
-        update_guild_data(interaction.guild.id, guild_data)
-        await update_thread_status(interaction.guild)
+        update_event_data(interaction.guild.id, thread_id, guild_data)
+        await update_thread_status(interaction.guild, thread_id)
         await interaction.response.send_message(
             f"✅ 已將角色名稱由 **{old_name}** 改為 **{new_name}**",
             ephemeral=True
@@ -1305,7 +1491,11 @@ class AdminCancelByNameModal(discord.ui.Modal, title="取消報名/代報"):
 
     async def on_submit(self, interaction: discord.Interaction):
         char_name = self.char_input.value.strip()
-        guild_data = get_guild_data(interaction.guild.id)
+        resolved = get_event_for_interaction(interaction)
+        if not resolved:
+            await interaction.response.send_message("❌ 請在活動討論串內操作。", ephemeral=True)
+            return
+        guild_data, thread_id = resolved
         found = _find_member_by_char_name(guild_data, char_name)
         if not found:
             await interaction.response.send_message(f"❌ 找不到角色「{char_name}」", ephemeral=True)
@@ -1317,13 +1507,13 @@ class AdminCancelByNameModal(discord.ui.Modal, title="取消報名/代報"):
         guild_data[src_name].pop(key, None)
         if src_name == "signups":
             remove_player_from_teams(guild_data, key)
-            update_guild_data(interaction.guild.id, guild_data)
+            update_event_data(interaction.guild.id, thread_id, guild_data)
             if job:
-                await promote_from_waitlist(interaction.guild, guild_data, job)
+                await promote_from_waitlist(interaction.guild, guild_data, job, thread_id)
         else:
-            update_guild_data(interaction.guild.id, guild_data)
+            update_event_data(interaction.guild.id, thread_id, guild_data)
 
-        await update_thread_status(interaction.guild)
+        await update_thread_status(interaction.guild, thread_id)
         status = "正式" if src_name == "signups" else "候補"
         await interaction.response.send_message(
             f"✅ 已取消 **{'(代報)' if is_proxy else ''}{char_name}【{job}】**（{status}）",
@@ -1354,7 +1544,11 @@ class AdminEditNameByInputModal(discord.ui.Modal, title="編輯角色名稱"):
     async def on_submit(self, interaction: discord.Interaction):
         old_name = self.old_input.value.strip()
         new_name = self.new_input.value.strip()
-        guild_data = get_guild_data(interaction.guild.id)
+        resolved = get_event_for_interaction(interaction)
+        if not resolved:
+            await interaction.response.send_message("❌ 請在活動討論串內操作。", ephemeral=True)
+            return
+        guild_data, thread_id = resolved
 
         found = _find_member_by_char_name(guild_data, old_name)
         if not found:
@@ -1377,8 +1571,8 @@ class AdminEditNameByInputModal(discord.ui.Modal, title="編輯角色名稱"):
                 if p and p.get("uid") == key:
                     p["char_name"] = new_name
 
-        update_guild_data(interaction.guild.id, guild_data)
-        await update_thread_status(interaction.guild)
+        update_event_data(interaction.guild.id, thread_id, guild_data)
+        await update_thread_status(interaction.guild, thread_id)
         await interaction.response.send_message(
             f"✅ 已將角色名稱由 **{old_name}** 改為 **{new_name}**",
             ephemeral=True
@@ -1410,9 +1604,16 @@ class EditRoleActionView(discord.ui.View):
 @bot.tree.command(name="edit_role", description="【管理員】編輯角色名稱或取消報名/代報")
 @has_required_role()
 async def edit_role(interaction: discord.Interaction):
-    guild_data = get_guild_data(interaction.guild.id)
+    resolved = get_event_for_interaction(interaction)
+    if not resolved:
+        await interaction.response.send_message(
+            "❌ 請在**活動討論串內**使用此指令。",
+            ephemeral=True
+        )
+        return
+    guild_data, _tid = resolved
     if not guild_data.get("event_name"):
-        await interaction.response.send_message("❌ 目前沒有進行中的活動。", ephemeral=True)
+        await interaction.response.send_message("❌ 此討論串沒有進行中的活動。", ephemeral=True)
         return
     if not guild_data.get("signups") and not guild_data.get("waitlist"):
         await interaction.response.send_message("❌ 目前沒有任何報名資料。", ephemeral=True)
@@ -1461,8 +1662,8 @@ async def reminder_cmd(interaction: discord.Interaction, 提醒內容: str, 提�
         await interaction.response.send_message("❌ 提醒時間必須是未來的時間。", ephemeral=True)
         return
 
-    guild_data = get_guild_data(interaction.guild.id)
-    reminders = guild_data.setdefault("reminders", [])
+    root = get_guild_root(interaction.guild.id)
+    reminders = root.setdefault("reminders", [])
     rid = f"{int(now.timestamp())}_{interaction.user.id}"
     reminders.append({
         "id": rid,
@@ -1472,7 +1673,7 @@ async def reminder_cmd(interaction: discord.Interaction, 提醒內容: str, 提�
         "channel_id": str(interaction.channel.id) if interaction.channel else None,
         "done": False
     })
-    update_guild_data(interaction.guild.id, guild_data)
+    save_guild_root(interaction.guild.id, root)
 
     display = format_datetime_display(dt)
     await interaction.response.send_message(
@@ -1532,21 +1733,39 @@ async def process_reminders():
             # 不加入 remaining = 已完成並移除
         if changed or len(remaining) != len(reminders):
             gdata["reminders"] = remaining
-            update_guild_data(int(gid), gdata)
+            # 提醒存在 guild root，不要用 update_guild_data（會誤當成活動）
+            if "events" in gdata:
+                save_guild_root(int(gid), gdata)
+            else:
+                update_guild_data(int(gid), gdata)
 
 
 @tasks.loop(minutes=5)
 async def check_deadline_task():
     data = load_data()
     for gid, gdata in data.items():
+        # 新格式：events 內每個討論串獨立判斷截止
+        events = gdata.get("events")
+        if isinstance(events, dict):
+            guild = bot.get_guild(int(gid))
+            for tid, ev in list(events.items()):
+                if ev.get("registration_closed"):
+                    continue
+                if is_deadline_passed(ev):
+                    ev["registration_closed"] = True
+                    update_event_data(int(gid), tid, ev)
+                    if guild:
+                        await update_thread_status(guild, int(tid))
+            continue
+        # 舊格式相容
         if gdata.get("registration_closed"):
             pass
         elif is_deadline_passed(gdata):
             gdata["registration_closed"] = True
             update_guild_data(int(gid), gdata)
             guild = bot.get_guild(int(gid))
-            if guild:
-                await update_thread_status(guild)
+            if guild and gdata.get("thread_id"):
+                await update_thread_status(guild, gdata.get("thread_id"))
 
 
 @tasks.loop(minutes=5)
