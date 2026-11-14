@@ -61,7 +61,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
-intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -1776,122 +1775,6 @@ async def check_reminder_task():
         await process_reminders()
     except Exception as e:
         print(f"處理提醒時發生錯誤: {e}")
-
-
-
-@bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    """
-    任何人對訊息加上 ➕（:heavy_plus_sign:）時，
-    以「按表情的人」的名稱與頭像，在同頻道重貼該則訊息內容。
-    不需管理員身分組。
-    """
-    # 忽略機器人自己
-    if payload.user_id == bot.user.id:
-        return
-
-    # 只處理 Discord 預設加號 ➕
-    emoji = payload.emoji
-    is_plus = (
-        str(emoji) == "➕"
-        or getattr(emoji, "name", None) in ("heavy_plus_sign", "➕")
-    )
-    if not is_plus:
-        return
-
-    if payload.guild_id is None:
-        return
-
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return
-
-    # 取得按表情的成員
-    member = guild.get_member(payload.user_id)
-    if member is None:
-        try:
-            member = await guild.fetch_member(payload.user_id)
-        except Exception:
-            return
-    if member.bot:
-        return
-
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(payload.channel_id)
-        except Exception:
-            return
-
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except Exception:
-        return
-
-    # 沒有文字、附件、embed 就不處理
-    has_content = bool(message.content and message.content.strip())
-    has_embeds = bool(message.embeds)
-    has_files = bool(message.attachments)
-    if not (has_content or has_embeds or has_files):
-        return
-
-    # 準備附件（下載後再上傳）
-    files = []
-    for att in message.attachments[:10]:  # 最多 10 個附件
-        try:
-            data = await att.read()
-            files.append(discord.File(fp=BytesIO(data), filename=att.filename))
-        except Exception:
-            pass
-
-    # 使用 webhook 讓訊息顯示為「按 ➕ 的人」
-    webhook = None
-    try:
-        # 優先重用同名 webhook，減少建立次數
-        existing = await channel.webhooks()
-        for wh in existing:
-            if wh.name == "訊息複製" and wh.user and wh.user.id == bot.user.id:
-                webhook = wh
-                break
-        if webhook is None:
-            # 需要「管理 Webhook」權限
-            avatar_bytes = None
-            try:
-                avatar_bytes = await bot.user.display_avatar.read()
-            except Exception:
-                pass
-            webhook = await channel.create_webhook(name="訊息複製", avatar=avatar_bytes, reason="訊息複製功能")
-    except discord.Forbidden:
-        # 沒有權限時退回：一般訊息並註明是誰觸發
-        try:
-            prefix = f"**{member.display_name}** 重貼：\n"
-            content = (prefix + (message.content or ""))[:2000]
-            await channel.send(content=content or prefix, embeds=message.embeds[:10] if message.embeds else None, files=files or None)
-        except Exception as e:
-            print(f"➕ 重貼失敗（無 webhook 權限）: {e}")
-        return
-    except Exception as e:
-        print(f"建立/取得 webhook 失敗: {e}")
-        return
-
-    try:
-        await webhook.send(
-            content=message.content if has_content else None,
-            username=member.display_name[:80],
-            avatar_url=member.display_avatar.url,
-            embeds=message.embeds[:10] if has_embeds else None,
-            files=files or None,
-            wait=True,
-        )
-    except Exception as e:
-        print(f"webhook 發送重貼失敗: {e}")
-    finally:
-        # 關閉暫時開啟的檔案
-        for f in files:
-            try:
-                f.close()
-            except Exception:
-                pass
 
 
 @bot.event
